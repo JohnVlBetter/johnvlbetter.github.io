@@ -5,20 +5,20 @@
 # prevent it from being included in the site.
 
 main:
-  - title: "Unity"
-    url: /publications/
-
-  - title: "渲染技术"
-    url: /talks/    
-
-  - title: "机器学习"
-    url: /teaching/    
-    
-  - title: "教程"
-    url: /portfolio/
-        
-  - title: "读书笔记"
+  - title: "技术分享"
     url: /year-archive/
+
+  #- title: "Talks"
+  #  url: /talks/    
+
+  - title: "系列教程"
+    url: /teaching/    
+
+  #- title: "Publications"
+  #  url: /publications/
+    
+  #- title: "Portfolio"
+  #  url: /portfolio/
     
   #- title: "CV"
   #  url: /cv/
