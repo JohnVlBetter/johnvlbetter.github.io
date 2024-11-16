@@ -1,5 +1,5 @@
 ---
-title: "Cocos开发微信小游戏系列教程(1)"
+title: "Cocos开发微信小游戏系列教程-1"
 collection: teaching
 #type: "Undergraduate course"
 permalink: /teaching/2024-cocos-wechat-1
