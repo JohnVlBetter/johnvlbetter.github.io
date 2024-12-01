@@ -292,7 +292,19 @@ void SubgroupMergeDepths(uint threadID : SV_GroupThreadID, uint bitIndex, inout 
 #endif
 }
 ```
-以第二级Mip生成代码为例,可以看到两次SubgroupMergeDepths之后，因为传入了0和1作为bitIndex，所以最终拿到的farDepth即为四个线程的最远Depth。在if判断“(threadID & 0x3) == 0”中，最终能通过的线程也就是第一个线程，所以第一个线程会将farDepth写入第二级Mip。每次Dispatch的线程组设置为64×1×1，所以最终第二级Mip会由第0、4、8、12、16、20、24、28、32、36、40、44、48、52、56、60号线程写入对应的每四个线程的farDepth。
+以第二级Mip生成代码为例，第0-3号线程的depth分别为d0、d1、d2和d3，第一次调用SubgroupMergeDepths后，每个线程的farDepth为：
+- 线程0：farDepth = FarthestDepth(d0, s_farDepth[0]) = FarthestDepth(d0, d1)（因为s_farDepth[0] = d1）
+- 线程1：farDepth = d1
+- 线程2：farDepth = FarthestDepth(d2, s_farDepth[1]) = FarthestDepth(d2, d3)（因为s_farDepth[1] = d3）
+- 线程3：farDepth = d3
+
+第二次调用SubgroupMergeDepths后，每个线程的farDepth为：
+- 线程0：farDepth = FarthestDepth(FarthestDepth(d0, d1), s_farDepth[0]) = FarthestDepth(FarthestDepth(d0,d1), FarthestDepth(d2, d3)) (也就是四个线程的最远Depth)
+- 线程1：farDepth = d1
+- 线程2：farDepth = FarthestDepth(d2, d3)
+- 线程3：farDepth = d3
+
+可以看到两次SubgroupMergeDepths之后，最终拿到的farDepth即为四个线程的最远Depth。在if判断“(threadID & 0x3) == 0”中，最终能通过的线程也就是第一个线程，所以第一个线程会将farDepth写入第二级Mip。每次Dispatch的线程组设置为64×1×1，所以最终第二级Mip会由第0、4、8、12、16、20、24、28、32、36、40、44、48、52、56、60号线程写入对应的每四个线程的farDepth。
 ```hlsl
 if (2 <= _MipCount)
 {
