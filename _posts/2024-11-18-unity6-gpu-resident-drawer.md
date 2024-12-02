@@ -154,6 +154,7 @@ for (int i = 0; i < instanceCount; ++i)
 [育碧ppt截图]
 
 首先我们分析下GPU Resident Drawer中生成Hiz深度图的部分，在源码中称其为OccluderDepthPyramid，OccluderDepthPyramid在Setting里设置最多有8级Mip，降采样时会以CameraDepthAttachment的1/8来计算，假设以3840*2160分辨率来计算的话，CameraDepthAttachment会是3072*1728的大小，整体的Mip如下表所示。
+
 | Width | Height |
 | :---: | :----: |
 |  384  |  324   |
@@ -164,7 +165,9 @@ for (int i = 0; i < instanceCount; ++i)
 |  12   |   11   |
 |   6   |   6    |
 |   3   |   3    |
+
 最终生成的OccluderDepthPyramid如下图所示。
+
 [OccluderDepthPyramid图]
 
 具体生成的代码在InstanceOcclusionCuller的CreateFarDepthPyramid函数中可以看到，具体核心代码如下。
@@ -344,3 +347,181 @@ if (4 <= _MipCount)
 }
 ```
 经过三次Dispatch之后，即可最终得到Hiz深度图，也就是OccluderDepthPyramid。后续即可通过这张OccluderDepthPyramid进行逐instance的深度遮挡剔除。
+
+GPU遮挡剔除的逻辑代码在InstanceCuller下的AddOcclusionCullingDispatch函数里，部分核心代码如下所示。
+```c#
+bool isFirstPass = (newBufferState == IndirectBufferContext.BufferState.AllInstancesOcclusionTested);
+bool isSecondPass = (newBufferState == IndirectBufferContext.BufferState.OccludedInstancesReTested);
+bool doCullInstances = (newBufferState != IndirectBufferContext.BufferState.Zeroed) && !doCopyInstances;
+...
+IndirectBufferAllocInfo allocInfo = m_IndirectStorage.GetAllocInfo(indirectContextIndex);
+...
+if (!allocInfo.IsEmpty())
+{
+    var cs = m_OcclusionTestShader.cs;
+    var firstPassKeyword = new LocalKeyword(cs, "OCCLUSION_FIRST_PASS");
+    var secondPassKeyword = new LocalKeyword(cs, "OCCLUSION_SECOND_PASS");
+    OccluderContext.SetKeyword(cmd, cs, firstPassKeyword, isFirstPass);
+    OccluderContext.SetKeyword(cmd, cs, secondPassKeyword, isSecondPass);
+    m_ShaderVariables[0] = new InstanceOcclusionCullerShaderVariables
+    {
+       ...
+    };
+    cmd.SetBufferData(m_ConstantBuffer, m_ShaderVariables);
+    cmd.SetComputeConstantBufferParam(cs, ShaderIDs.InstanceOcclusionCullerShaderVariables, m_ConstantBuffer, 0, m_ConstantBuffer.stride);
+    occlusionCullingCommon.PrepareCulling(cmd, in occluderCtx, settings, subviewSettings, m_OcclusionTestShader, occlusionDebug);
+    ...
+    if (doCullInstances)
+    {
+        int kernel = m_CullInstancesKernel;
+        cmd.SetComputeBufferParam(cs, kernel, ShaderIDs._DrawInfo, bufferHandles.drawInfoBuffer);
+        cmd.SetComputeBufferParam(cs, kernel, ShaderIDs._InstanceInfo, bufferHandles.instanceInfoBuffer);
+        cmd.SetComputeBufferParam(cs, kernel, ShaderIDs._DrawArgs, bufferHandles.argsBuffer);
+        cmd.SetComputeBufferParam(cs, kernel, ShaderIDs._InstanceIndices, bufferHandles.instanceBuffer);
+        cmd.SetComputeBufferParam(cs, kernel, ShaderIDs._InstanceDataBuffer, batchersContext.gpuInstanceDataBuffer);
+        cmd.SetComputeBufferParam(cs, kernel, ShaderIDs._OcclusionDebugCounters, m_OcclusionEventDebugArray.CounterBuffer);
+        if (isFirstPass || isSecondPass)
+            OcclusionCullingCommon.SetDepthPyramid(cmd, m_OcclusionTestShader, kernel, occluderHandles);
+        if (isSecondPass)
+            cmd.DispatchCompute(cs, kernel, bufferHandles.argsBuffer, (uint)(GraphicsBuffer.IndirectDrawIndexedArgs.size * allocInfo.GetExtraDrawInfoSlotIndex()));
+        else
+            cmd.DispatchCompute(cs, kernel, (allocInfo.instanceCount + 63) / 64, 1, 1);
+    }
+}
+```
+可以看到，整个遮挡剔除过程分成了两个Pass：FirstPass和SecondPass，也就对应了上文中提到的两遍剔除，第二遍剔除是为了保留上一帧中不可见但本帧中可见的物体。对应的Compute Shader代码在InstanceOcclusionCullingKernels.compute里的CullInstances Kernel中，具体代码如下所示。
+```hlsl
+#pragma multi_compile _ OCCLUSION_FIRST_PASS OCCLUSION_SECOND_PASS
+
+#if defined(OCCLUSION_FIRST_PASS) || defined(OCCLUSION_SECOND_PASS)
+#define OCCLUSION_ANY_PASS
+#endif
+
+[numthreads(64,1,1)]
+void CullInstances(uint instanceInfoOffset : SV_DispatchThreadID)
+{
+    uint instanceInfoCount = GetInstanceInfoCount();
+    if (instanceInfoOffset < instanceInfoCount)
+    {
+        IndirectInstanceInfo instanceInfo = LoadInstanceInfo(instanceInfoOffset);
+        uint drawOffset = instanceInfo.drawOffsetAndSplitMask >> 8;
+        uint splitMask = instanceInfo.drawOffsetAndSplitMask & 0xff;
+
+        // early out if none of these culling splits are visible
+        // TODO: plumb through other state per draw command to filter here?
+        if ((splitMask & _CullingSplitMask) == 0)
+            return;
+
+        bool isVisible = true;
+
+#ifdef OCCLUSION_ANY_PASS
+        int instanceID = instanceInfo.instanceIndexAndCrossFade & 0xffffff;
+        SphereBound boundingSphere = LoadInstanceBoundingSphere(instanceID);
+
+        bool isOccludedInAll = true;
+        for (int testIndex = 0; testIndex < _OcclusionTestCount; ++testIndex)
+        {
+            // unpack the culling split index and subview index for this test
+            int splitIndex = (_CullingSplitIndices >> (4 * testIndex)) & 0xf;
+            int subviewIndex = (_OccluderSubviewIndices >> (4 * testIndex)) & 0xf;
+
+            // skip if this draw call is not present in this split index
+            if (((1 << splitIndex) & splitMask) == 0)
+                continue;
+
+            // occlusion test against the corresponding subview
+            if (IsOcclusionVisible(boundingSphere, subviewIndex))
+                isOccludedInAll = false;
+        }
+        isVisible = !isOccludedInAll;
+        
+#ifdef OCCLUSION_FIRST_PASS
+        // if we failed the occlusion check, then add to the list for the second pass
+        if (!isVisible)
+        {
+            uint writeIndex = 0;
+            InterlockedAdd(_DrawArgs[DRAW_ARGS_INDEX_INSTANCE_COUNTER], 1, writeIndex);
+            _InstanceInfo[_InstanceInfoAllocIndex + INSTANCE_INFO_OFFSET_SECOND_PASS(writeIndex)] = instanceInfo;
+        }
+#endif
+#endif
+
+        if (isVisible)
+        {
+            uint argsBase = DRAW_ARGS_INDEX(drawOffset);
+            uint offsetWithinDraw = 0;
+            InterlockedAdd(_DrawArgs[argsBase + 1], 1 << _InstanceMultiplierShift, offsetWithinDraw);   // IndirectDrawIndexedArgs.instanceCount
+            offsetWithinDraw = offsetWithinDraw >> _InstanceMultiplierShift;
+
+            IndirectDrawInfo drawInfo = LoadDrawInfo(drawOffset);
+            uint writeIndex = drawInfo.firstInstanceGlobalIndex + offsetWithinDraw;
+            _InstanceIndices.Store(writeIndex << 2, instanceInfo.instanceIndexAndCrossFade);
+        }
+    }
+}
+```
+首先根据设置Keyword（OCCLUSION_FIRST_PASS和OCCLUSION_ANY_PASS）的不同，可以对应到上文的两个Pass（FirstPass和SecondPass），每次执行首先获取到当前instance的drawOffset和splitMask，splitMask即为上文中提到的cpu端剔除结果，通过“(splitMask & _CullingSplitMask) == 0”这条判断即可提前判断出当前instance是否对于所有的culling splits都完全不可见，以便提前退出计算。而后根据instanceID可以获取到instance的外包围球信息，接下来遍历每个subview，对于每个subview再做一次具体的split可见性判断，通过之后再通过IsOcclusionVisible计算遮挡可见性，最终全部都通过的instance即可标记为可见，进而执行后面的渲染数据录入。
+从上文中可以看出，遮挡剔除的核心函数是IsOcclusionVisible，通过IsOcclusionVisible可以计算出当前instance的遮挡可见性，IsOcclusionVisible函数的详细代码位于OcclusionCullingCommon.hlsl下，部分核心代码如下所示。
+
+```hlsl
+TEXTURE2D(_OccluderDepthPyramid);
+SAMPLER(s_linear_clamp_sampler);
+
+bool IsOcclusionVisible(float3 frontCenterPosRWS, float2 centerPosNDC, float2 radialPosNDC, int subviewIndex)
+{
+    bool isVisible = true;
+    float queryClosestDepth = ComputeNormalizedDeviceCoordinatesWithZ(frontCenterPosRWS, _ViewProjMatrix[subviewIndex]).z;
+    bool isBehindCamera = dot(frontCenterPosRWS, _FacingDirWorldSpace[subviewIndex].xyz) >= 0.f;
+
+    float2 centerCoordInTopMip = centerPosNDC * _DepthSizeInOccluderPixels.xy;
+    float radiusInPixels = length((radialPosNDC - centerPosNDC) * _DepthSizeInOccluderPixels.xy);
+
+    // log2 of the radius in pixels for the gather4 mip level
+    int mipLevel = 0;
+    float mipPartUnused = frexp(radiusInPixels, mipLevel);
+    mipLevel = max(mipLevel + 1, 0);
+    if (mipLevel < OCCLUSIONCULLINGCOMMONCONFIG_MAX_OCCLUDER_MIPS && !isBehindCamera)
+    {
+        // scale our coordinate to this mip
+        float2 centerCoordInChosenMip = ldexp(centerCoordInTopMip, -mipLevel);
+        int4 mipBounds = _OccluderMipBounds[mipLevel];
+        mipBounds.y += subviewIndex * _OccluderMipLayoutSizeY;
+
+        if ((_OcclusionTestDebugFlags & OCCLUSIONTESTDEBUGFLAG_ALWAYS_PASS) == 0)
+        {
+            // gather4 occluder depths to cover this radius
+            float2 gatherUv = (float2(mipBounds.xy) + clamp(centerCoordInChosenMip, .5f, float2(mipBounds.zw) - .5f)) * _OccluderDepthPyramidSize.zw;
+            float4 gatherDepths = GATHER_TEXTURE2D(_OccluderDepthPyramid, s_linear_clamp_sampler, gatherUv);
+            float occluderDepth = FarthestDepth(gatherDepths);
+            isVisible = IsVisibleAfterOcclusion(occluderDepth, queryClosestDepth);
+        }
+
+    }
+
+    return isVisible;
+}
+```
+
+IsOcclusionVisible的参数是boundingSphere通过CalculateBoundingObjectData计算得到，CalculateBoundingObjectData的详细代码如下所示。
+```hlsl
+BoundingObjectData CalculateBoundingObjectData(SphereBound boundingSphere,
+    float4x4 viewProjMatrix,
+    float4 viewOriginWorldSpace,
+    float4 radialDirWorldSpace,
+    float4 facingDirWorldSpace)
+{
+    const float3 centerPosRWS = boundingSphere.center - viewOriginWorldSpace.xyz;
+
+    const float3 radialVec = abs(boundingSphere.radius) * radialDirWorldSpace.xyz;
+    const float3 facingVec = abs(boundingSphere.radius) * facingDirWorldSpace.xyz;
+
+    BoundingObjectData data;
+    data.centerPosNDC = ComputeNormalizedDeviceCoordinates(centerPosRWS, viewProjMatrix);
+    data.radialPosNDC = ComputeNormalizedDeviceCoordinates(centerPosRWS + radialVec, viewProjMatrix);
+    data.frontCenterPosRWS = centerPosRWS + facingVec;
+    return data;
+}
+```
+在IsOcclusionVisible中，首先通过frontCenterPosRWS和subview索引计算出计算出queryClosestDepth，也就是包围球最近的那个深度值。然后使用frexp和max(mipLevel + 1, 0)计算出四个像素就能覆盖外包围球半径像素数的最大Mip级别，接下来通过ldexp将centerCoordInTopMip缩放到这级Mip得到centerCoordInChosenMip，再通过mipBounds计算得到采样的uv值，“clamp(centerCoordInChosenMip, .5f, float2(mipBounds.zw) - .5f)”操作则是防止采样到区域之外。最后通过GATHER_TEXTURE2D能取到四个深度值，通过它们与queryClosestDepth的比较之后，即可判断出当前instance外包围球是否被遮挡。
+
+现在我们了解了完整的instance剔除流程，程序执行到这里也拿到了要渲染的数据，接下来我们接着来分析instance渲染部分源码。
