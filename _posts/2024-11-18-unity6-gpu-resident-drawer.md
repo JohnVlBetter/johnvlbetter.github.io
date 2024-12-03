@@ -153,7 +153,7 @@ for (int i = 0; i < instanceCount; ++i)
 接下来我们接着分析遮挡剔除的源码，在Unity6中，BRG新增支持了两种DrawCommand，分别是Indirect和Procedural，这也就意味着在Unity6的GPU Resident Drawer中，可以支持到GPU Culling。GPU Resident Drawer中遮挡剔除采用了Two-Phase Occlusion Culling，这个方式是育碧在2015年的Siggraph上提出的，在Two-Phase Occlusion Culling中剔除分成了两个阶段，在第一阶段中使用上一帧的Hiz深度图去剔除一遍物体，然后渲染剔除通过的物体的深度，在第二阶段生成当前帧的Hiz深度图，使用这张Hiz深度图再剔除一遍第一阶段被剔除的物体，也就是保留上一帧中不可见但本帧中可见的物体，具体实例图如下所示。
 [育碧ppt截图]
 
-首先我们分析下GPU Resident Drawer中生成Hiz深度图的部分，在源码中称其为OccluderDepthPyramid，OccluderDepthPyramid在Setting里设置最多有8级Mip，降采样时会以CameraDepthAttachment的1/8来计算，假设以3840*2160分辨率来计算的话，CameraDepthAttachment会是3072*1728的大小，整体的Mip如下表所示。
+首先我们分析下GPU Resident Drawer中生成Hiz深度图的部分，在源码中称其为OccluderDepthPyramid，OccluderDepthPyramid在Setting里设置最多有8级Mip，降采样时会以CameraDepthAttachment的1/8来计算，假设以3840\*2160分辨率来计算的话，CameraDepthAttachment会是3072\*1728的大小，整体的Mip如下表所示。
 
 | Width | Height |
 | :---: | :----: |
@@ -522,6 +522,66 @@ BoundingObjectData CalculateBoundingObjectData(SphereBound boundingSphere,
     return data;
 }
 ```
-在IsOcclusionVisible中，首先通过frontCenterPosRWS和subview索引计算出计算出queryClosestDepth，也就是包围球最近的那个深度值。然后使用frexp和max(mipLevel + 1, 0)计算出四个像素就能覆盖外包围球半径像素数的最大Mip级别，接下来通过ldexp将centerCoordInTopMip缩放到这级Mip得到centerCoordInChosenMip，再通过mipBounds计算得到采样的uv值，“clamp(centerCoordInChosenMip, .5f, float2(mipBounds.zw) - .5f)”操作则是防止采样到区域之外。最后通过GATHER_TEXTURE2D能取到四个深度值，通过它们与queryClosestDepth的比较之后，即可判断出当前instance外包围球是否被遮挡。
+在IsOcclusionVisible中，首先通过frontCenterPosRWS和subview索引计算出queryClosestDepth，也就是包围球最近的那个深度值。然后使用frexp和max(mipLevel + 1, 0)计算出四个像素就能覆盖外包围球半径像素数的最大Mip级别，接下来通过ldexp将centerCoordInTopMip缩放到这级Mip得到centerCoordInChosenMip，再通过mipBounds计算得到采样的uv值，“clamp(centerCoordInChosenMip, .5f, float2(mipBounds.zw) - .5f)”操作则是防止采样到区域之外。最后通过GATHER_TEXTURE2D能取到四个深度值，通过它们与queryClosestDepth的比较之后，即可判断出当前instance外包围球是否被遮挡。
 
-现在我们了解了完整的instance剔除流程，程序执行到这里也拿到了要渲染的数据，接下来我们接着来分析instance渲染部分源码。
+通过上文我们了解了完整的instance剔除流程，接下来我们来梳理完整的GPUResidentDrawer执行流程。GPUResidentDrawer在构造时通过InsertIntoPlayerLoop函数将自己的PostPostLateUpdate注册进了PlayerLoop的FinishFrameRendering上，进而即可在FinishFrameRendering时执行处理Material、Mesh和LODGroup相关的数据。同时GPUResidentDrawer内部声明了GPUResidentBatcher，可以通过GPUResidentBatcher来创建写入及更新instance的相关数据。GPUResidentBatcher也可以通过调用InstanceCullingBatcher来执行遮挡剔除和视椎体剔除，GPUResidentBatcher每帧去更新Renderer的相关数据，并将其打成Batch。InstanceCullingBatcher内部维护着BatchRendererGroup，于是便可以通过BRG来注册删除Mesh、Material及Batch，并且通过BRG的OnPerformCulling回调去调用InstanceCuller的CreateCullJobTree来进行视椎体剔除、Binning、PrefixSum等操作，InstanceCuller内部同样封装着InstanceOcclusionTest来进行GPU的遮挡剔除操作。通过BRG来执行DrawCommandOutputPerBatch，进而利用到了新增的BatchDrawCommandIndirect，最后整套流程得以走通，完成了整体的数据准备，便可以开始绘制。
+
+最后我们来简单讲一下渲染部分，通过GPUResidentDrawer渲染的物体的Shader需要支持DOTSInstance，原本正常Shader存在CBuffer中的材质属性现在都会放入UnityDOTSInstancing_MaterialPropertyMetadata中，属性都会通过UNITY_DOTS_INSTANCED_PROP来定义，在使用时通过UNITY_ACCESS_DOTS_INSTANCED_PROP_WITH_DEFAULT取出，对应代码可以看LitInput.hlsl，截取部分代码示例如下。
+```hlsl
+#ifdef UNITY_DOTS_INSTANCING_ENABLED
+
+UNITY_DOTS_INSTANCING_START(MaterialPropertyMetadata)
+    UNITY_DOTS_INSTANCED_PROP(float4, _BaseColor)
+    ...
+    UNITY_DOTS_INSTANCED_PROP(float , _Cutoff)
+    UNITY_DOTS_INSTANCED_PROP(float , _Smoothness)
+    UNITY_DOTS_INSTANCED_PROP(float , _Metallic)
+    ...
+    UNITY_DOTS_INSTANCED_PROP(float , _Surface)
+UNITY_DOTS_INSTANCING_END(MaterialPropertyMetadata)
+
+static float4 unity_DOTS_Sampled_BaseColor;
+...
+static float  unity_DOTS_Sampled_Cutoff;
+static float  unity_DOTS_Sampled_Smoothness;
+static float  unity_DOTS_Sampled_Metallic;
+...
+static float  unity_DOTS_Sampled_Surface;
+
+#undef UNITY_SETUP_DOTS_MATERIAL_PROPERTY_CACHES
+#define UNITY_SETUP_DOTS_MATERIAL_PROPERTY_CACHES() SetupDOTSLitMaterialPropertyCaches()
+
+void SetupDOTSLitMaterialPropertyCaches()
+{
+    unity_DOTS_Sampled_BaseColor            = UNITY_ACCESS_DOTS_INSTANCED_PROP_WITH_DEFAULT(float4, _BaseColor);
+    ...
+    unity_DOTS_Sampled_Cutoff               = UNITY_ACCESS_DOTS_INSTANCED_PROP_WITH_DEFAULT(float , _Cutoff);
+    unity_DOTS_Sampled_Smoothness           = UNITY_ACCESS_DOTS_INSTANCED_PROP_WITH_DEFAULT(float , _Smoothness);
+    unity_DOTS_Sampled_Metallic             = UNITY_ACCESS_DOTS_INSTANCED_PROP_WITH_DEFAULT(float , _Metallic);
+    ...
+    unity_DOTS_Sampled_Surface              = UNITY_ACCESS_DOTS_INSTANCED_PROP_WITH_DEFAULT(float , _Surface);
+}
+
+#define _BaseColor              unity_DOTS_Sampled_BaseColor
+...
+#define _Cutoff                 unity_DOTS_Sampled_Cutoff
+#define _Smoothness             unity_DOTS_Sampled_Smoothness
+#define _Metallic               unity_DOTS_Sampled_Metallic
+...
+#define _Surface                unity_DOTS_Sampled_Surface
+
+#endif
+```
+
+UNITY_ACCESS_DOTS_INSTANCED_PROP_WITH_DEFAULT会将Unity上传到SSBO排布好的数据按偏移查找出来，UNITY_DOTS_INSTANCED_PROP去定义了这些数据在SSBO上的排列顺序，在DOTS中的数据排列是按SOA去组织的，示例图如下所示。
+[SOA排布图]
+
+普通Shader中我们会通过UNITY_SETUP_INSTANCE_ID去设置InstanceID，但是在使用DOTS时，会转而调用SetupDOTSVisibleInstancingData方法，进而获取到unity_SampledDOTSIndirectVisibleIndex，并且初始化SH和Bounds的数据，如果Shader中定义了UNITY_SETUP_DOTS_MATERIAL_PROPERTY_CACHES，那也会在此时完成对应材质属性的读取。那为什么要这么麻烦额外计算unity_SampledDOTSIndirectVisibleIndex这些数据呢？原因就在于我们上文中提到的遮挡剔除是在GPU端执行的，最后的剔除结果并没有回读到CPU端，所以我们在CPU端是不知道instance的可见性的，只能通过这种方式去获取可见的Instance数据。
+
+现在我们已经完整（？）的理解了整个GPU Resident Drawer的执行流程，其实还有很多细节的地方没有提及，比如：
+- CPU端是如何整理排布Batch的。
+- Instance相关数据如何上传、更新及销毁的。
+- GPUResidentDrawer的Debug显示是如何执行的。
+- ....
+
+这些东西感兴趣的读者可以自行查看源码来深入了解，本文章就不做更全面的分析了。总体来看Unity的新GPU Driven管线还是没能脱离原本的BRG和DOTS，没能做到更细粒度（Meshlet）的剔除和渲染，也就更做不到Nanite的无极LOD等等技术了。但是BRG新增的BatchDrawCommandIndirect和BatchDrawCommandProcedural可以让开发者自身做出更细致更定制化的技术方案，也算是个不错的选择。写到这里这篇GPU Resident Drawer的浅析也就结束了，本人技术水平尚低，如果有大佬发现了文章中的错误，希望可以联系我去指正修改~
