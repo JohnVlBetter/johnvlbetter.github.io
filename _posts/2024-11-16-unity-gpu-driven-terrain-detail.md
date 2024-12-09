@@ -1,7 +1,7 @@
 ---
 title: 'Unity GPU Driven地形细节渲染方案'
 date: 2024-11-16
-permalink: /posts/2012/08/blog-post-4/
+permalink: /posts/2024/1116/UnityGPUDrivenTerrainDetail/
 tags:
   - Unity
   - Terrain Detail
