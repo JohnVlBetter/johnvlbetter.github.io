@@ -28,7 +28,7 @@ tags:
 
 ### Internal-UIRDefault Shader
 我们首先来看Internal-UIRDefault这个Shader的源码，由于内置到引擎后的UI Toolkit查看不到对应Shader了，我就到Github找到了一份历史版本先凑合对照，对应仓库为 https://github.com/needle-mirror/com.unity.ui ，大家可以自行clone阅读源码。
-首先Shader中对于是否支持Shader Model 3.5（后文简称SM3.5）做了区分，支持SM3.5的设备会从_ShaderInfoTex中读取ClipRect和Transform数据，不支持SM3.5的设备使用CBuffer传递读取数据。并且支持SM3.5的设备会使用nointerpolation和8个图集槽位，不支持的设备只能使用4个图集槽位，区分Shader Model部分代码如下所示。
+首先Shader中对于是否支持Shader Model 3.5（后文简称SM3.5）做了区分，支持SM3.5的设备会从_ShaderInfoTex中读取ClipRect和Transform数据，不支持SM3.5的设备使用CBuffer传递读取数据。并且支持SM3.5的设备会使用nointerpolation和8个图集槽位，不支持的设备只能使用4个图集槽位，区分Shader Model部分代码如下所示：
 
 ```hlsl
 #if SHADER_TARGET >= 30
@@ -82,7 +82,7 @@ CBUFFER_END
 
 #endif // !UIE_SHADER_INFO_IN_VS
 ```
-但目前版本的Shader中_FontTex已经合进了8个图集槽位中，具体实现已经与上边源码有所差异。对于_Texture0-8这8个图集，UI Toolkit使用代码二分去采样对应槽位的纹理，具体代码如下所示。
+但目前版本的Shader中_FontTex已经合进了8个图集槽位中，具体实现已经与上边源码有所差异。对于_Texture0-8这8个图集，UI Toolkit使用代码二分去采样对应槽位的纹理，具体代码如下所示：
 ```hlsl
 // index: integer between [0..UIE_TEXTURE_SLOT_COUNT]
 float4 SampleTextureSlot(half index, float2 uv)
@@ -165,7 +165,7 @@ float4 SampleTextureSlot(half index, float2 uv)
   - settingIndex(用于采样_GradientSettingsTex，来计算SVG渐变)
 - 从_ShaderInfoTex中计算出clipRect数据
 
-对应VS部分源码如下所示。
+对应VS部分源码如下所示：
 ```hlsl
 v2f uie_std_vert(appdata_t v, out float4 clipSpacePos)
 {
@@ -223,3 +223,68 @@ v2f uie_std_vert(appdata_t v, out float4 clipSpacePos)
     return OUT;
 }
 ```
+接下来我们继续看FS部分：
+- 如果是SM3.5以下的设备，先通过_ClipRects计算裁剪
+- 根据VS传入的typeTexSettings判断UI类型，分别进行处理：
+  - 如果isTextured为true，则通过传入的texture slot的索引采样对应槽位的图集
+  - 如果isText为true，则采样_FontTex并计算特殊字体效果（描边、阴影等）
+  - 如果isSvgGradients为true，则通过_GradientSettingsTex获取数据，计算矢量图显示
+- 混合计算最终颜色
+
+代码很简单，FS部分代码如下所示：
+```hlsl
+UIE_FRAG_T uie_std_frag(v2f IN)
+{
+    uie_fragment_clip(IN);
+
+    // Extract the render type
+    bool isSolid        = IN.typeTexSettings.x == 1;
+    bool isText         = IN.typeTexSettings.x == 2;
+    bool isTextured     = IN.typeTexSettings.x == 3;
+    bool isSvgGradients = IN.typeTexSettings.x == 4;
+    float settingIndex = IN.typeTexSettings.z;
+
+    float2 uv = IN.uvXY.xy;
+
+#if !UIE_SHADER_INFO_IN_VS
+    IN.color.a *= tex2D(_ShaderInfoTex, IN.clipRectOpacityUVs.zw).a;
+#endif // !UIE_SHADER_INFO_IN_VS
+
+    UIE_FRAG_T texColor = (UIE_FRAG_T)isSolid;
+    if (isTextured)
+        texColor = SampleTextureSlot(IN.typeTexSettings.y, uv);
+
+    float textAlpha = tex2D(_FontTex, uv).a;
+    if (isText)
+    {
+        if (_FontTexSDFScale > 0.0f)
+            texColor = uie_textcore(textAlpha, uv, IN.textCoreUVs.xy, IN.color, IN.clipPos.w);
+        else
+            texColor = UIE_FRAG_T(1, 1, 1, tex2D(_FontTex, uv).a);
+    }
+    else if (isSvgGradients)
+    {
+        float2 texelSize = _TextureInfo[IN.typeTexSettings.y].yz;
+        GradientLocation grad = uie_sample_gradient_location(settingIndex, uv, _GradientSettingsTex, _GradientSettingsTex_TexelSize.xy);
+        grad.location *= texelSize.xyxy;
+        grad.uv *= grad.location.zw;
+        grad.uv += grad.location.xy;
+        texColor = SampleTextureSlot(IN.typeTexSettings.y, grad.uv);
+    }
+
+    UIE_FRAG_T color = (isText && _FontTexSDFScale > 0.0f) ? texColor : texColor * IN.color;
+    return color;
+}
+```
+综上可以看出，Internal-UIRDefault这个Shader整体逻辑非常简单，就是简单的根据外部传入的顶点数据来采样对应八个槽位的图集，加上采样_GradientSettingsTex和_ShaderInfoTex（或者传入的CBuffer）去获取相关的数据，最后计算混合输出，就能成功的一次绘制大量图文混排的UI。我们通过FrameDebugger来截取一帧对照验证，对应截取结果如下所示：
+![FrameDebugger](../images/UIR1.jpeg "FrameDebugger")
+通过FrameDebugger截图可以看到，这一次调用绘制的UI Mesh有1320个顶点，722个三角形。我们再来看下图集槽位和相关传入数据：
+![FrameDebugger](../images/UIR2.jpeg "FrameDebugger")
+可以看到八个图集槽位只用到了0和1两个，对应的Transform和Clip相关数据也存入了ShaderInfoTex中，这样便存储了完整的一次绘制用到的全部数据。在FrameDebugger中看不到此次绘制的更具体信息，我们可以使用Render Doc来查看更细化的渲染信息，使用RenderDoc截取的结果如下图所示：
+![FrameDebugger](../images/RenderDoc1.jpeg "FrameDebugger")
+可以看到UIR.DrawRange底层是通过几次DrawIndexed来调用绘制的，此次DrawRange分成了四个DrawIndexed，我们再来看下对应的Mesh长什么样。
+![FrameDebugger](../images/RenderDoc2.jpeg "FrameDebugger")
+可以看到UI Toolkit已经把一堆图文混排的UI合成了一个大Mesh，再来看下传入的图集和ShaderInfoTex。
+![FrameDebugger](../images/RenderDoc3.jpeg "FrameDebugger")
+第一张纹理就是存着Transform和Clip等数据的ShaderInfoTex，第二张纹理对应的是这个界面用到的UI图集，第二张为这个UI界面用到的字体图集。
+渲染部分我们就大概捋清楚了，现在可以去看看C#逻辑部分是如何合并UI以及更新相关数据的。
