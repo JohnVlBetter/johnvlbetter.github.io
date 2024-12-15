@@ -288,3 +288,208 @@ UIE_FRAG_T uie_std_frag(v2f IN)
 ![FrameDebugger](../images/RenderDoc3.jpeg "FrameDebugger")
 第一张纹理就是存着Transform和Clip等数据的ShaderInfoTex，第二张纹理对应的是这个界面用到的UI图集，第二张为这个UI界面用到的字体图集。
 渲染部分我们就大概捋清楚了，现在可以去看看C#逻辑部分是如何合并UI以及更新相关数据的。
+
+### UI Toolkit CS脚本逻辑
+UI Toolkit渲染部分主要的逻辑都在UIRenderDevice和UIRRenderChain这两个脚本里，在RenderChain中存储着所有标记为Dirty的VisualElement（VisualElement是UI Toolkit中UI控件的基类），VisualElement被标记为Dirty的原因有很多种，可以由下面的源码看出具体的所有Dirty原因。
+```c#
+internal enum RenderDataDirtyTypes
+{
+    None = 0,
+    Transform = 1 << 0,
+    ClipRectSize = 1 << 1,
+    Clipping = 1 << 2,           // The clipping state of the VE needs to be reevaluated.
+    ClippingHierarchy = 1 << 3,  // Same as above, but applies to all descendants too.
+    Visuals = 1 << 4,            // The visuals of the VE need to be repainted.
+    VisualsHierarchy = 1 << 5,   // Same as above, but applies to all descendants too.
+    VisualsOpacityId = 1 << 6,   // The vertices only need their opacityId to be updated.
+    Opacity = 1 << 7,            // The opacity of the VE needs to be updated.
+    OpacityHierarchy = 1 << 8,   // Same as above, but applies to all descendants too.
+    Color = 1 << 9,              // The background color of the VE needs to be updated.
+    AllVisuals = Visuals | VisualsHierarchy | VisualsOpacityId
+}
+```
+在RenderChain中通过维护一个名为RenderChainCommand的Command链表来记录命令，命令的类型有很多种，我们主要来看CommandType.Draw的部分，其余类型可以在RenderChainCommand中自行查看。首先在每帧的Update中会调用ProcessChanges去处理UI，对于被标记为Dirty的VisualElement一一进行对应的处理，比如对于Transform改变的VisualElement去通过renderChain.shaderInfoAllocator.SetTransformValue修改_ShaderInfoTex中对应纹素的数值。每个Dirty的VisualElement都会被m_VisualChangesProcessor通过MeshGenerationContext来记录生成对应的UI Mesh,当全部Dirty的VisualElement全部处理完毕之后，就得到了最终渲染所用到的Mesh及渲染数据。节选部分源码展示如下：
+```c#
+public void ProcessChanges()
+{
+    k_MarkerProcess.Begin();
+    int dirtyClass;
+    RenderDataDirtyTypes dirtyFlags;
+    RenderDataDirtyTypes clearDirty;
+
+    //跳过ProcessOnClippingChanged、ProcessOnOpacityChanged和ProcessOnColorChanged
+
+    m_DirtyTracker.dirtyID++;
+    dirtyClass = (int)RenderDataDirtyTypeClasses.TransformSize;
+    dirtyFlags = RenderDataDirtyTypes.Transform | RenderDataDirtyTypes.ClipRectSize;
+    clearDirty = ~dirtyFlags;
+    k_MarkerTransformProcessing.Begin();
+    for (int depth = m_DirtyTracker.minDepths[dirtyClass]; depth <= m_DirtyTracker.maxDepths[dirtyClass]; depth++)
+    {
+        VisualElement ve = m_DirtyTracker.heads[depth];
+        while (ve != null)
+        {
+            VisualElement veNext = ve.renderChainData.nextDirty;
+            if ((ve.renderChainData.dirtiedValues & dirtyFlags) != 0)
+            {
+                if (ve.renderChainData.isInChain && ve.renderChainData.dirtyID != m_DirtyTracker.dirtyID)
+                    RenderEvents.ProcessOnTransformOrSizeChanged(this, ve, m_DirtyTracker.dirtyID, ref m_Stats);
+                m_DirtyTracker.ClearDirty(ve, clearDirty);
+            }
+            ve = veNext;
+        }
+    }
+
+    //...........
+
+    for (int depth = m_DirtyTracker.minDepths[dirtyClass]; depth <= m_DirtyTracker.maxDepths[dirtyClass]; depth++)
+    {
+        VisualElement ve = m_DirtyTracker.heads[depth];
+        while (ve != null)
+        {
+            VisualElement veNext = ve.renderChainData.nextDirty;
+            if ((ve.renderChainData.dirtiedValues & dirtyFlags) != 0)
+            {
+                if (ve.renderChainData.isInChain && ve.renderChainData.dirtyID != m_DirtyTracker.dirtyID)
+                    m_VisualChangesProcessor.ProcessOnVisualsChanged(ve, m_DirtyTracker.dirtyID, ref m_Stats);
+                m_DirtyTracker.ClearDirty(ve, clearDirty);
+            }
+            ve = veNext;
+            m_Stats.dirtyProcessed++;
+        }
+    }
+    m_MeshGenerationDeferrer.ProcessDeferredWork(m_VisualChangesProcessor.meshGenerationContext);
+    // Mesh Generation doesn't currently support multiple rounds of generation, so we must flush all deferred
+    // work and then schedule the MeshGenerationJobs (and process it's associated callback). Once we make it
+    // support multiple rounds, we should move the following call above ProcessDeferredWork and get rid of the
+    // second call to ProcessDeferredWork.
+    m_VisualChangesProcessor.ScheduleMeshGenerationJobs();
+    m_MeshGenerationDeferrer.ProcessDeferredWork(m_VisualChangesProcessor.meshGenerationContext);
+    jobManager.CompleteConvertMeshJobs();
+    jobManager.CompleteCopyMeshJobs();
+    opacityIdAccelerator.CompleteJobs();
+
+    //.........
+}
+```
+
+接下来就是渲染调用的部分，主要逻辑在UIRenderDevice的EvaluateChain中。EvaluateChain传入RenderChainCommand链表的头节点，通过遍历这个链表去依次执行渲染绘制的调用。对于每个类型为Draw的节点，UI Toolkit都会尝试将其合为一批进行绘制，但是还是有特殊情况会打断这个合批，主要有下面几种情况：
+- 材质发生变化
+- MeshHandle的Page发生变化
+- 无可分配的图集槽位
+- stencilRef发生变化
+- 当前为最后一个Range切标记了stashRange
+- doBreakBatches为true
+- ...
+
+对于以上种种情况，逻辑中会用stashRange和kickRanges做标记。如果没触发以上情况，则进行连续绘制记录，持续累加能够合批的UI Vertex长度和Index长度。而如果触发了以上种种情况之一打断了合批，就会保存下来已经记录的所有顶点索引相关信息，存入ranges中留待绘制调用。对于kickRanges标记为true的情况，UI Toolkit会直接通过DrawRanges去将已经存下的Range构建成SerializedCommand添加到m_Commands中，最后在Execute执行时会将m_Commands遍历调用Utility.DrawRanges绘制，Utility.DrawRanges为UI Toolkit Native层的绘制接口，通过传入VB、IB的指针和绘制范围即可绘制GPU Buffer的一部分。节选部分源码展示如下：
+```c#
+while (head != null)
+{
+    //......
+    bool isLastRange = curDrawRange.indexCount > 0 && rangesReady == rangesCount - 1;
+    bool stashRange = false; // Should we close the contiguous draw range that we had before this command (if any)?
+    bool kickRanges = false; // Should we draw all the ranges that we had accumulated so far?
+    bool mustApplyCmdState = false; // Whenever a state change is detected, this must be true.
+    int textureSlot = -1; // This avoids looping to find the index again in ApplyDrawCommandState
+    Material newMat = null; // This avoids repeating the null check in ApplyDrawCommandState
+    bool newMatDiffers = false; // This avoids repeating the material comparison in ApplyDrawCommandState
+    if (head.type == CommandType.Draw)
+    {
+        newMat = head.state.material != null ? head.state.material : defaultMat;
+        if (newMat != st.curState.material)
+        {
+            mustApplyCmdState = true;
+            newMatDiffers = true;
+            stashRange = true;
+            kickRanges = true;
+        }
+        if (head.mesh.allocPage != st.curPage)
+        {
+            mustApplyCmdState = true;
+            stashRange = true;
+            kickRanges = true;
+        }
+        else if (curDrawIndex != head.mesh.allocIndices.start + head.indexOffset)
+            stashRange = true; // Same page but discontinuous range.
+        if (head.state.texture != TextureId.invalid)
+        {
+            mustApplyCmdState = true;
+            textureSlot = m_TextureSlotManager.IndexOf(head.state.texture);
+            if (textureSlot < 0 && m_TextureSlotManager.FreeSlots < 1)
+            { // No more slots available.
+                stashRange = true;
+                kickRanges = true;
+            }
+        }
+        if (head.state.stencilRef != st.curState.stencilRef)
+        {
+            mustApplyCmdState = true;
+            stashRange = true;
+            kickRanges = true;
+        }
+        if (stashRange && isLastRange)
+        {
+            kickRanges = true;
+        }
+    }
+    else
+    {
+        stashRange = true;
+        kickRanges = true;
+    }
+    if (doBreakBatches)
+    {
+        stashRange = true;
+        kickRanges = true;
+    }
+    if (stashRange)
+    {
+        //存储Range Index Vertex相关信息（firstIndex、indexCount、vertsReferenced、minIndexVal等等）
+    }
+    else // Only continuous draw commands can get here because other commands force stash+kick
+    {
+        //累加更新Range Index Vertex相关信息（indexCount、minIndexVal、vertsReferenced、firstIndex等等）
+        head = head.next;
+        continue;
+    }
+    if (kickRanges)
+    {
+        if (rangesReady > 0)
+        {
+            ApplyBatchState(ref st);
+            //里面是DrawRanges相关
+            KickRanges(ranges, ref rangesReady, ref rangesStart, rangesCount, st.curPage, st.activeCommandList);
+        }
+        //.......
+    } // If kick ranges
+    if (head.type == CommandType.Draw && mustApplyCmdState)
+        ApplyDrawCommandState(head, textureSlot, newMat, newMatDiffers, ref st);
+    head = head.next;
+} // While there are commands to execute
+// Kick any pending ranges, this usually occurs when the draw chain ends with a draw command.
+if (curDrawRange.indexCount > 0)
+{
+    int wrapAroundIndex = (rangesStart + rangesReady++) & rangesCountMinus1;
+    ranges[wrapAroundIndex] = curDrawRange;
+}
+if (rangesReady > 0)
+{
+    ApplyBatchState(ref st);
+            //里面是DrawRanges相关
+    KickRanges(ranges, ref rangesReady, ref rangesStart, rangesCount, st.curPage, st.activeCommandList);
+}
+```
+
+至此我们就大致理顺UI Toolkit渲染部分的逻辑了，其余细节读者可自行下载Unity的CSReference（Github可下载：https://github.com/Unity-Technologies/UnityCsReference ）去查看，UI Toolkit的源码都位于UnityCsReference\Modules\UIElements目录下。
+
+## 总结
+Unity UI Toolkit通过合并Mesh以及优化绘制调用去尽可能的一次绘制大量图文混排的UI，在传统UI系统中会打断UI合批的情况都会尝试做优化处理，比如:
+- 将Transform和ClipRect等信息存入_ShaderInfoTex或者对应的CBuffer中
+- 底层维护一个大的VB和IB Buffer，数据修改时通过Offset更新，绘制时通过Offset绘制
+- Shader中维护多个（8个或者4个）图集槽位，动态修改对应槽位的图集
+- ....
+Unity这套新UI渲染方案的思路值得我们去学习，可以将其灵活的用在项目开发中，比如大量的伤害数字显示、SLG中同屏大量玩家名字头像图文混排等等情况。
+
+## 参考引用
+- Unity UI Toolkit官方文档 https://docs.unity3d.com/Manual/UIElements.html
