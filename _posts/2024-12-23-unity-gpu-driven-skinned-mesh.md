@@ -61,3 +61,33 @@ void main(uint3 threadID : SV_DispatchThreadID, StructuredBuffer<MeshVertex> inV
 这些实现细节就不在这篇文章中过多描述了，感兴趣的读者可自行实现。
 
 ### BlendShape部分
+BlendShape的计算需要维护inBlendShapeVertices这个Buffer，里面存储着所有BlendShape Frame的顶点变换信息（vertexIdx、deltaPos、deltaNormal和deltaTangent）。在每帧就可以遍历全部的BlendShape去通过inBlendShapeVertices来计算每个BlendShape的变换，简化版的Compute Shader代码如下。
+```hlsl
+[numthreads(64, 1, 1)]
+void main(uint3 threadID : SV_DispatchThreadID, RWStructuredBuffer<MeshVertex> inOutMeshVertices, StructuredBuffer<BlendShapeVertex> inBlendShapeVertices)
+{
+    const uint t = threadID.x;
+    if (t >= g_VertCount) return;
+
+    BlendShapeVertex blendShapeVert = inBlendShapeVertices[t + g_FirstVert];
+    const uint vertIndex = blendShapeVert.index;
+
+    inOutMeshVertices[vertIndex].pos += blendShapeVert.pos * g_Weight;
+    inOutMeshVertices[vertIndex].norm += blendShapeVert.norm * g_Weight;
+    inOutMeshVertices[vertIndex].tang.xyz += blendShapeVert.tang * g_Weight;
+}
+```
+GPU BlendShape计算也有一些细节没有具体描述，比如：
+- 区分是否需要计算Normal和Tangent数据，因为有些情况下并不需要法线或者切线数据。
+- BlendShape Frame的过渡计算。
+- 根据距离动态减少BlendShape的计算数量。
+
+
+通过上述的操作我们就能每帧完成SkinnedMesh的蒙皮计算和BlendShape计算，也可通过视椎体剔除、分帧计算、距离LOD（减少骨骼数或者BlendShape数）等方法优化性能。
+
+## Meshlet
+在GPU Driven管线中，蒙皮网格和静态网格最主要的区别就是，我们没办法预计算一个固定的Meshlet数据（包围盒和Normal Cone）。SkinnedMesh每帧都在随着动画变化，每个Meshlet对应的包围盒和Normal Cone也都随着变化，没法使用提前预计算好的数据去做GPU剔除。我们只有两个方案可以解决这个问题：
+- 离线预生成，暴力穷举所有动画每一帧里每个Meshlet的包围盒和Normal Cone。
+- 实时在每一帧里计算每个Meshlet的包围盒和Normal Cone。
+
+第一种方案适合动画数量较少且已知的情况，并不通用，因此我们不做考虑。
