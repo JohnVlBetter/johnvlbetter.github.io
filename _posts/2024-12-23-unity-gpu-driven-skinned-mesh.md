@@ -9,7 +9,11 @@ tags:
 ---
 
 ## 前言
-最近项目中有支持SkinnedMesh GPU Driven渲染的需求，正好前段时间看到了Digital Dragons发布的Erik Jansson的演讲，其中就有对于心灵杀手2里蒙皮网格的GPU Driven渲染介绍，就整理了一下思路进行了这次尝试，将整体的实现流程记录下来。本篇文章不会具体讲GPU Driven管线的基础知识和相关搭建实现，如果不懂这些前置知识的话可以先去看看其他相关文章了解一下，这样可以更好的阅读本篇文章。
+最近项目中有支持SkinnedMesh GPU Driven渲染的需求，正好前段时间看到了Digital Dragons发布的Erik Jansson的演讲，其中就有心灵杀手2里的GPU Driven SkinnedMesh的渲染介绍，就整理了一下思路进行了尝试，并且将整体的实现流程记录下来。本篇文章不会具体讲GPU Driven管线的基础知识和相关搭建实现，如果不懂这些前置知识的话可以先去看看其他知乎大佬的相关文章了解一下，这样可以更好的阅读本篇文章。
+下面先放一下心灵杀手2里的GPU Driven渲染Meshlet的可视化图及实际效果图，图中的植被都是通过GPU Bone驱动的，人物也是GPU Driven的SkinnedMesh。
+![Meshlet可视化图](../images/meshlet_visualization.jpeg "Meshlet可视化图")
+
+![实际渲染效果](../images/meshlet_visualization1.jpeg "实际渲染效果")
 
 ## GPU Skinning
 Unity内置的GPU Skinning可以通过GetVertexBuffer获取到蒙皮计算之后的顶点数据，但是我们没办法很好地去控制调度，因此我们首先需要自行实现一下自定义的GPU Skinning方案。在Unity官网上我们可以下载到对应版本的计算Skinning及BlendShape的Compute Shader，接下来我们先给出一个简单的计算流程。
@@ -86,7 +90,7 @@ GPU BlendShape计算也有一些细节没有具体描述，比如：
 通过上述的操作我们就能每帧完成SkinnedMesh的蒙皮计算和BlendShape计算，也可通过视椎体剔除、分帧计算、距离LOD（减少骨骼数或者BlendShape数）等方法优化性能。
 
 ## Meshlet
-在GPU Driven管线中，蒙皮网格和静态网格最主要的区别就是，我们没办法预计算一个固定的Meshlet数据（包围盒和Normal Cone）。SkinnedMesh每帧都在随着动画变化，每个Meshlet对应的包围盒和Normal Cone也都随着变化，没法使用提前预计算好的数据去做GPU剔除。我们只有两个方案可以解决这个问题：
+在GPU Driven管线中，蒙皮网格和静态网格最主要的区别就是我们没办法预计算一个固定的Meshlet数据（包围盒和Normal Cone）。SkinnedMesh每帧都在随着动画变化，每个Meshlet对应的包围盒和Normal Cone也都随着变化，没法使用提前预计算好的数据去做GPU剔除。我们有两个方案可以解决这个问题：
 - 离线预生成，暴力穷举所有动画每一帧里每个Meshlet的包围盒和Normal Cone。
 - 实时在每一帧里计算每个Meshlet的包围盒和Normal Cone。
 
@@ -114,7 +118,16 @@ void ComputeMeshletBounds(uint3 threadID : SV_DispatchThreadID)
 }
 ```
 
-上述代码中用到了Wave Intrinsics中的几个内置函数，Wave Intrinsics是D3D12在Shader Model 6.0中引入的，用于控制Warp中Lane（可近似看做Thread）之间共享和同步数据，比如WaveIsFirstLane就能判断当前Lane是否是Wave中的第一个Active Lane（即索引最小的那个），WaveActiveMin和WaveActiveMax能获取到当前Wave中所有Active的Min值和Max值。我们可以通过Dispatch顶点数个Thread，将Group内Thread的数量（即Wave内Lane的数量）设置为Meshlet的顶点数，通过Wave函数来计算当前Meshlet的包围盒。Normal Cone的计算也可以类比实现出来，本文中就不做详细解释，感兴趣的读者可尝试自行实现。
+上述代码中用到了Wave Intrinsics中的几个内置函数，Wave Intrinsics是D3D12在Shader Model 6.0中引入的，用于控制Warp中Lane（可近似看做Thread）之间共享和同步数据，比如WaveIsFirstLane就能判断当前Lane是否是Wave中的第一个Active Lane（即索引最小的那个），WaveActiveMin和WaveActiveMax能获取到当前Wave中所有Active的Min值和Max值。我们可以通过Dispatch顶点数个Thread，将Group内Thread的数量（当前情况下即Wave内Lane的数量）设置为Meshlet的顶点数，通过Wave函数来计算当前Meshlet的包围盒。Normal Cone的计算也可以类比实现出来，本文中就不做详细解释，感兴趣的读者可尝试自行实现，Wave Intrinsics相关可以去看丛越大神的文章（https://zhuanlan.zhihu.com/p/469436345）。
+
+有了Bounds和Normal Cone的数据之后我们就可以进行GPU Culling，下面的图就是我在Unity中使用视椎体剔除后的结果，可以看到视椎体之外的Meshlet在动画运行时也能正确剔除。
+
+Scene中显示Main Camera的视椎体剔除：
+![剔除结果1](../images/CullingResult1.jpeg "剔除结果1")
+![剔除结果2](../images/CullingResult2.jpeg "剔除结果2")
+
+Main Camera中的显示：
+![剔除结果3](../images/CullingResult3.jpeg "剔除结果3")
 
 想要在Unity中使用Wave Intrinsics的话，首先需要在Compute Shader中添加"#pragma use_dxc"这行代码，并且使用DX12启动Unity编辑器（可在Hub中设置项目的命令函参数，添加"-force-d3d12"）。这种实现难以兼容其他平台，对于不支持Wave Intrinsics的设备，我们可以考虑使用InterlockedMin和InterlockedMax来替换WaveActiveMin和WaveActiveMax，在计算完当前顶点数据后通过GroupMemoryBarrierWithGroupSync函数同步Thread之间的数据，再通过InterlockedMin和InterlockedMax来计算包围盒数据。对应的包围盒数据存储入groupshared的数组中去，简化后的代码如下所示：
 ```hlsl
@@ -157,7 +170,7 @@ meshlet.max = data.max;
 _MeshletBuffer[meshletID] = meshlet;
 ```
 
-UE5.5中支持了Nanite Skeletal Mesh，我翻了一下对应的源码，发现UE5.5中就是类似的实现，可能是为了规避某些问题，UE5.5 Nanite里对应部分的源码也放一下：
+UE5.5中也支持了Nanite Skeletal Mesh，我翻了一下对应的源码，发现UE5.5中就是类似的实现，可能是为了规避某些问题，UE5.5 Nanite里对应部分的源码也放一下：
 ```hlsl
 if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SKINNED_MESH) != 0)
 {
@@ -177,11 +190,12 @@ if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SKINNED_MESH) != 0)
 
 虚幻官方也标注了这不是一个合适的解决方案，因为会减少剔除率和其他问题，可能后续会有更好的实现来替换掉这部分代码。
 现在我们通过运行时计算获取到了Meshlet的Bounds和Normal Cone数据，通过这些数据我们就可以实时的在GPU上进行剔除（背面剔除、贡献剔除、视椎体剔除和遮挡剔除），并且我们在蒙皮时进行了分帧计算和Animation LOD操作，通过这些处理，我们能够大幅度减少蒙皮网格带来的的性能消耗，甚至可以像心灵杀手2中一样，在场景中摆上大量高面数的骨骼驱动的植被，如下图所示。
-[心灵杀手2Meshlet图]
+![GPU驱动骨骼植被](../images/GPU_animation_pic2WDraw.jpeg "GPU驱动骨骼植被")
 
 # 总结
-这个方案在Unity中实现了GPU Driven SkinnedMesh，包括了自定义的GPU Skinning、BlendShape计算以及实时计算Meshlet的包围盒和Normal Cone，而数据组织、GPU Culling以及渲染部分没有做涉及，对这几部分感兴趣的读者可以自行阅读知乎其他大佬的相关文章。此方案详细的代码实现在本人工作的项目工程中，没有办法放出来，但大体思路是一致的，感兴趣的读者可以尝试自己照着实现一下。如果有大佬发现了文章中的错误，希望能够联系我及时更正~
+这个方案在Unity中实现了GPU Driven SkinnedMesh，包括了自定义的GPU Skinning、BlendShape计算以及实时计算Meshlet的包围盒和Normal Cone，而数据组织、GPU Culling以及绘制调用等部分没有做涉及，对这几部分感兴趣的读者可以自行阅读知乎其他大佬的相关文章。此方案详细的代码实现在本人工作的项目工程中，没有办法放出来，但大体思路是一致的，感兴趣的读者可以尝试自己照着实现一下。如果有大佬发现了文章中的错误，希望能够联系我及时更正~
 
 # 参考引用
 - Erik Jansson的心灵杀手2技术分享 https://www.youtube.com/watch?v=EtX7WnFhxtQ&t=1008s
 - Northlight技术展示 https://www.remedygames.com/article/how-northlight-makes-alan-wake-2-shine
+- 丛越大神的随笔0x28 https://zhuanlan.zhihu.com/p/469436345
