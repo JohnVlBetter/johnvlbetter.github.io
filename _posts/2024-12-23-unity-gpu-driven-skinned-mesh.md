@@ -90,4 +90,98 @@ GPU BlendShape计算也有一些细节没有具体描述，比如：
 - 离线预生成，暴力穷举所有动画每一帧里每个Meshlet的包围盒和Normal Cone。
 - 实时在每一帧里计算每个Meshlet的包围盒和Normal Cone。
 
-第一种方案适合动画数量较少且已知的情况，并不通用，因此我们不做考虑。
+第一种方案适合动画数量较少且已知的情况，并不通用，因此我们不做考虑。第二种方案里，我们需要实时的计算每个Meshlet的包围盒和Normal Cone数据，包围盒和Normal Cone可以通过Compute Shader去遍历Meshlet的全部顶点来计算，比如我们使用64个三角形和64个顶点的Meshlet，对应Meshlet包围盒的计算方法简化版如下：
+```hlsl
+[numthreads(64, 1, 1)]
+void ComputeMeshletBounds(uint3 threadID : SV_DispatchThreadID)
+{
+  //计算顶点数据
+  ......
+
+  float3 boundMin = float3(0,0,0);
+  float3 boundMax = float3(0,0,0);
+  boundMin = WaveActiveMin(vertexPos);
+  boundMax = WaveActiveMax(vertexPos);
+  if (WaveIsFirstLane())//只需要第一个Lane写入
+  {
+      meshlet.min = boundMin;
+      meshlet.max = boundMax;
+      _MeshletBuffer[meshletID] = meshlet;
+  }
+
+  //其余操作
+  ......
+}
+```
+
+上述代码中用到了Wave Intrinsics中的几个内置函数，Wave Intrinsics是D3D12在Shader Model 6.0中引入的，用于控制Warp中Lane（可近似看做Thread）之间共享和同步数据，比如WaveIsFirstLane就能判断当前Lane是否是Wave中的第一个Active Lane（即索引最小的那个），WaveActiveMin和WaveActiveMax能获取到当前Wave中所有Active的Min值和Max值。我们可以通过Dispatch顶点数个Thread，将Group内Thread的数量（即Wave内Lane的数量）设置为Meshlet的顶点数，通过Wave函数来计算当前Meshlet的包围盒。Normal Cone的计算也可以类比实现出来，本文中就不做详细解释，感兴趣的读者可尝试自行实现。
+
+想要在Unity中使用Wave Intrinsics的话，首先需要在Compute Shader中添加"#pragma use_dxc"这行代码，并且使用DX12启动Unity编辑器（可在Hub中设置项目的命令函参数，添加"-force-d3d12"）。这种实现难以兼容其他平台，对于不支持Wave Intrinsics的设备，我们可以考虑使用InterlockedMin和InterlockedMax来替换WaveActiveMin和WaveActiveMax，在计算完当前顶点数据后通过GroupMemoryBarrierWithGroupSync函数同步Thread之间的数据，再通过InterlockedMin和InterlockedMax来计算包围盒数据。对应的包围盒数据存储入groupshared的数组中去，简化后的代码如下所示：
+```hlsl
+groupshared int minMax[6];
+[numthreads(64, 1, 1)]
+void ComputeMeshletBounds(uint3 threadID : SV_DispatchThreadID)
+{
+  //计算顶点数据
+  ......
+
+  //Group同步
+  GroupMemoryBarrierWithGroupSync();
+
+  //InterlockedMin和InterlockedMax只支持uint，所以要做转化，factor值是随便写的
+  uint factor = 100000;
+  InterlockedMin(minMax[0], factor * oPos.x);
+  InterlockedMin(minMax[1], factor * oPos.y);
+  InterlockedMin(minMax[2], factor * oPos.z);
+  InterlockedMax(minMax[3], factor * oPos.x);
+  InterlockedMax(minMax[4], factor * oPos.y);
+  InterlockedMax(minMax[5], factor * oPos.z);
+  if (threadIndexInGroup == 0)//只需要第一个线程写入
+  {
+      meshlet.min = float3(minMax[0] / 100000.0, minMax[1] / 100000.0, minMax[2] / 100000.0);
+      meshlet.max = float3(minMax[3] / 100000.0, minMax[4] / 100000.0, minMax[5] / 100000.0);
+      _MeshletBuffer[meshletID] = meshlet;
+  }
+
+  //其余操作
+  ......
+}
+```
+
+大量的InterlockedMin和InterlockedMax会大大降低性能，因此在低端设备或者移动端上其实可以不计算，而是使用Instance的包围盒数据替代，示例伪代码如下：
+```hlsl
+...
+InstanceData data = _InstanceDataBuffer[instanceID];
+meshlet.min = data.min;
+meshlet.max = data.max;
+_MeshletBuffer[meshletID] = meshlet;
+```
+
+UE5.5中支持了Nanite Skeletal Mesh，我翻了一下对应的源码，发现UE5.5中就是类似的实现，可能是为了规避某些问题，UE5.5 Nanite里对应部分的源码也放一下：
+```hlsl
+if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SKINNED_MESH) != 0)
+{
+	// TODO: Nanite-Skinning - Fun hack to temporarily "fix" broken cluster culling and VSM
+	// Set the cluster bounds for skinned meshes equal to the skinned instance local bounds
+	// for clusters and also node hierarchy slices. This satisfies the constraint that all
+	// clusters in a node hierarchy have bounds fully enclosed in the parent bounds (monotonic).
+	// Note: We do not touch the bounding sphere in Bounds because that would break actual
+	// LOD decimation of the Nanite mesh. Instead we leave these in the offline computed ref-pose
+	// so that we get reasonable "small enough to draw" calculations driving the actual LOD.
+	// This is not a proper solution, as it hurts culling rate, and also causes VSM to touch far
+	// more pages than necessary. But it's decent in the short term during R&D on a proper calculation.
+	Bounds.BoxExtent = InstanceData.LocalBoundsExtent;
+	Bounds.BoxCenter = InstanceData.LocalBoundsCenter;
+}
+```
+
+虚幻官方也标注了这不是一个合适的解决方案，因为会减少剔除率和其他问题，可能后续会有更好的实现来替换掉这部分代码。
+现在我们通过运行时计算获取到了Meshlet的Bounds和Normal Cone数据，通过这些数据我们就可以实时的在GPU上进行剔除（背面剔除、贡献剔除、视椎体剔除和遮挡剔除），并且我们在蒙皮时进行了分帧计算和Animation LOD操作，通过这些处理，我们能够大幅度减少蒙皮网格带来的的性能消耗，甚至可以像心灵杀手2中一样，在场景中摆上大量高面数的骨骼驱动的植被，如下图所示。
+[心灵杀手2Meshlet图]
+
+# 总结
+这个方案在Unity中实现了GPU Driven SkinnedMesh，包括了自定义的GPU Skinning、BlendShape计算以及实时计算Meshlet的包围盒和Normal Cone，而数据组织、GPU Culling以及渲染部分没有做涉及，对这几部分感兴趣的读者可以自行阅读知乎其他大佬的相关文章。此方案详细的代码实现在本人工作的项目工程中，没有办法放出来，但大体思路是一致的，感兴趣的读者可以尝试自己照着实现一下。如果有大佬发现了文章中的错误，希望能够联系我及时更正~
+
+# 参考引用
+- Erik Jansson的心灵杀手2技术分享 https://www.youtube.com/watch?v=EtX7WnFhxtQ&t=1008s
+- Northlight技术展示 https://www.remedygames.com/article/how-northlight-makes-alan-wake-2-shine
